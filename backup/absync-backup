@@ -1,0 +1,78 @@
+#!/bin/bash
+
+set -euo pipefail
+
+source /usr/local/etc/absync-backup.conf
+
+function help() {
+    cat << EOF >&2
+Usage:
+    ${0} [OPTION]... [SUBCOMMAND] [ARG]...
+
+Options:
+    -h          show help
+
+Subcommands:
+    mountpoint
+    sync [OPTION]... SRC DEST
+EOF
+}
+
+function print_stderr() {
+    echo "$(hostname):" "$(basename "${BASH_SOURCE[0]}"):" "${@}" >&2
+}
+
+function subcommand_mountpoint() {
+    echo "${BACKUP_MOUNTPOINT}"
+}
+
+function subcommand_sync() {
+    if [ ${#@} -gt 2 ]
+    then
+        OPTIONS=("${@:1:$((${#@} - 2))}")
+    else
+        OPTIONS=(-arv --delete)
+    fi
+
+    SRC="${@:$((${#@} - 1)):1}"
+    DEST="${@:$((${#@} - 0)):1}"
+
+    print_stderr "Synchronizing..."
+
+    mkdir -p "${BACKUP_MOUNTPOINT}/${DEST}"
+
+    rsync \
+    "${OPTIONS[@]}" \
+    "${SRC}" \
+    "${BACKUP_MOUNTPOINT}/${DEST}/"
+
+    print_stderr "Synchronized successfully"
+}
+
+while getopts 'h' OPT
+do
+    case "${OPT}" in
+        h)
+            help
+            exit 1
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+case "${1}" in
+    mountpoint)
+        subcommand_mountpoint
+        ;;
+    sync)
+        subcommand_sync "${@:2}"
+        ;;
+    *)
+        print_stderr "${1}: invalid subcommand" >&2
+        exit 1
+        ;;
+esac

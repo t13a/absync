@@ -1,0 +1,266 @@
+#!/bin/bash
+
+set -euo pipefail
+
+function help() {
+    cat << EOF >&2
+Usage:
+    ${0} [OPTION]... [SUBCOMMAND] [ARG]...
+
+Options:
+    -h          show help
+
+Subcommands:
+    active-snapshot [SUBCOMMAND] [ARG]...
+    backup [SUBCOMMAND] [ARG]...
+    cron
+    forward-active
+    forward-backup
+    sync [OPTION]...
+EOF
+}
+
+function check_vars() {
+    local EMPTY_VARS=0
+
+    for VAR_NAME in "${@}"
+    do
+        if [ -z "${!VAR_NAME:-}" ]
+        then
+            EMPTY_VARS="$((${EMPTY_VARS} + 1))"
+
+            print_stderr "${VAR_NAME}=${!VAR_NAME:-}"
+        fi
+    done
+    
+    if [ ${EMPTY_VARS} -gt 0 ]
+    then
+        print_stderr "${EMPTY_VARS} empty var(s) found"
+        exit 1
+    fi
+}
+
+function print_stderr() {
+    echo "$(hostname):" "$(basename "${BASH_SOURCE[0]}"):" "${@}" >&2
+}
+
+function subcommand_active_snapshot() {
+    ssh \
+    -i "${ACTIVE_SSH_IDENTITY}" \
+    -o StrictHostKeyChecking=no \
+    -p "${ACTIVE_SSH_PORT}" \
+    "${ACTIVE_SSH_USER}@${ACTIVE_SSH_HOST}" \
+    sudo \
+    "${ACTIVE_SNAPSHOT_CMD}" \
+    "${@}"
+}
+
+function subcommand_backup() {
+    ssh \
+    -i "${BACKUP_SSH_IDENTITY}" \
+    -o StrictHostKeyChecking=no \
+    -p "${BACKUP_SSH_PORT}" \
+    "${BACKUP_SSH_USER}@${BACKUP_SSH_HOST}" \
+    sudo \
+    "${BACKUP_CMD}" \
+    "${@}"
+}
+
+function subcommand_cron() {
+
+    function push_metrics() {
+        [ -z "${PROMETHEUS_ENABLED}" ] && return 0
+    
+        if curl \
+        --cacert "${PROMETHEUS_PUSHGATEWAY_CA_CERT}" \
+        --data-binary \
+        @- \
+        "${PROMETHEUS_PUSHGATEWAY_URL}/metrics/job/${PROMETHEUS_JOB}/controller/${PROMETHEUS_CONTROLLER}"
+        then
+            print_stderr "Pushed metrics"
+        else
+            print_stderr "Failed to push metrics, but continue"
+        fi
+    }
+
+    function push_metrics_begin() {
+        cat << EOF | push_metrics
+# HELP absync_begin_time absync begin time, in unixtime.
+# TYPE absync_begin_time gauge
+absync_begin_time{instance="${PROMETHEUS_INSTANCE}"} $(date +%s)
+EOF
+    }
+
+    function push_metrics_end() {
+        cat << EOF | push_metrics
+# HELP absync_end_time absync end time, in unixtime.
+# TYPE absync_end_time gauge
+absync_end_time{instance="${PROMETHEUS_INSTANCE}"} $(date +%s)
+# HELP absync_end_status absync end status, 0 in success, otherwise in failure.
+# TYPE absync_end_status gauge
+absync_end_status{instance="${PROMETHEUS_INSTANCE}"} ${1}
+EOF
+    }
+
+    function terminate() {
+        STATUS=$?
+
+        subcommand_active_snapshot unmount-and-delete || STATUS=$?
+        push_metrics_end "${STATUS}"
+        return ${STATUS}
+    }
+
+    trap 'terminate' EXIT INT TERM
+    push_metrics_begin
+    subcommand_forward_active
+    subcommand_forward_backup
+    subcommand_active_snapshot create-and-mount
+    subcommand_sync "${@}"
+}
+
+function subcommand_forward_active() {
+
+    function check() {
+        ssh \
+        -i "${ACTIVE_SSH_IDENTITY}" \
+        -o StrictHostKeyChecking=no \
+        -S "/dev/shm/${ACTIVE_SSH_USER}@${ACTIVE_SSH_HOST}.socket" \
+        -O check \
+        -p "${ACTIVE_SSH_PORT}" \
+        "${ACTIVE_SSH_USER}@${ACTIVE_SSH_HOST}"
+    }
+
+    function start() {
+        ssh \
+        -i "${ACTIVE_SSH_IDENTITY}" \
+        -o StrictHostKeyChecking=no \
+        -M \
+        -S "/dev/shm/${ACTIVE_SSH_USER}@${ACTIVE_SSH_HOST}.socket" \
+        -o "ControlPersist=${ACTIVE_SSH_CONTROL_PERSIST}" \
+        -fNT \
+        -L "${ACTIVE_SSH_FORWARD_PORT}:localhost:873" \
+        -p "${ACTIVE_SSH_PORT}" \
+        "${ACTIVE_SSH_USER}@${ACTIVE_SSH_HOST}"
+    }
+
+    if check
+    then
+        print_stderr "Already established to forward from active"
+    else
+        print_stderr "Establishing to forward from active..."
+        start
+        print_stderr "Establised to forward successfully"
+    fi
+}
+
+function subcommand_forward_backup() {
+
+    function check() {
+        ssh \
+        -i "${BACKUP_SSH_IDENTITY}" \
+        -o StrictHostKeyChecking=no \
+        -S "/dev/shm/${BACKUP_SSH_USER}@${BACKUP_SSH_HOST}.socket" \
+        -O check \
+        -p "${BACKUP_SSH_PORT}" \
+        "${BACKUP_SSH_USER}@${BACKUP_SSH_HOST}"
+    }
+
+    function start() {
+        ssh \
+        -i "${BACKUP_SSH_IDENTITY}" \
+        -o StrictHostKeyChecking=no \
+        -M \
+        -S "/dev/shm/${BACKUP_SSH_USER}@${BACKUP_SSH_HOST}.socket" \
+        -o "ControlPersist=${BACKUP_SSH_CONTROL_PERSIST}" \
+        -fNT \
+        -R "${BACKUP_SSH_FORWARD_PORT}:localhost:${ACTIVE_SSH_FORWARD_PORT}" \
+        -p "${BACKUP_SSH_PORT}" \
+        "${BACKUP_SSH_USER}@${BACKUP_SSH_HOST}"
+    }
+
+    if check
+    then
+        print_stderr "Already established to forward to backup"
+    else
+        print_stderr "Forwarding to backup..."
+        start
+        print_stderr "Forwarded to backup successfully"
+    fi
+}
+
+function subcommand_sync() {
+    ACTIVE_SNAPSHOT_MODULE="$(subcommand_active_snapshot module)"
+
+    subcommand_backup \
+    sync \
+    "${@}" \
+    "rsync://localhost:${BACKUP_SSH_FORWARD_PORT}/${ACTIVE_SNAPSHOT_MODULE}" \
+    "${ACTIVE_SSH_HOST}"
+}
+
+while getopts 'hn' OPT
+do
+    case "${OPT}" in
+        h)
+            help
+            exit 1
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+check_vars \
+ACTIVE_SNAPSHOT_CMD \
+ACTIVE_SSH_USER \
+ACTIVE_SSH_HOST \
+ACTIVE_SSH_PORT \
+ACTIVE_SSH_IDENTITY \
+ACTIVE_SSH_CONTROL_PERSIST \
+ACTIVE_SSH_FORWARD_PORT \
+BACKUP_CMD \
+BACKUP_SSH_USER \
+BACKUP_SSH_HOST \
+BACKUP_SSH_PORT \
+BACKUP_SSH_IDENTITY \
+BACKUP_SSH_CONTROL_PERSIST \
+BACKUP_SSH_FORWARD_PORT \
+PROMETHEUS_ENABLED
+
+if [ -n "${PROMETHEUS_ENABLED}" ]
+then
+    check_vars \
+    PROMETHEUS_JOB \
+    PROMETHEUS_INSTANCE \
+    PROMETHEUS_CONTROLLER \
+    PROMETHEUS_PUSHGATEWAY_URL \
+    PROMETHEUS_PUSHGATEWAY_CA_CERT
+fi
+
+case "${1}" in
+    active-snapshot)
+        subcommand_active_snapshot "${@:2}"
+        ;;
+    backup)
+        subcommand_backup "${@:2}"
+        ;;
+    cron)
+        subcommand_cron "${@:2}"
+        ;;
+    forward-active)
+        subcommand_forward_active
+        ;;
+    forward-backup)
+        subcommand_forward_backup
+        ;;
+    sync)
+        subcommand_sync "${@:2}"
+        ;;
+    *)
+        print_stderr "${1}: invalid subcommand"
+        exit 1
+        ;;
+esac

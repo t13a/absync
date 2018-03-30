@@ -1,0 +1,191 @@
+#!/bin/bash
+
+set -euo pipefail
+
+source /usr/local/etc/absync-active-snapshot.conf
+
+function help() {
+    cat << EOF >&2
+Usage:
+    ${0} [OPTION]... [SUBCOMMAND]
+
+Options:
+    -h          show help
+
+Subcommands:
+    create
+    create-and-mount
+    delete
+    module
+    mount
+    mountpoint
+    status
+    unmount
+    unmount-and-delete
+EOF
+}
+
+function print_stderr() {
+    echo "$(hostname):" "$(basename "${BASH_SOURCE[0]}"):" "${@}" >&2
+}
+
+function subcommand_create() {
+    print_stderr "Creating..."
+    lvcreate \
+    -s \
+    -l "${ACTIVE_SNAPSHOT_EXTENTS}" \
+    -n "${ACTIVE_SNAPSHOT_LV}" \
+    "/dev/${ACTIVE_VG}/${ACTIVE_LV}"
+    print_stderr "Created successfully"
+}
+
+function subcommand_create_and_mount() {
+    STATUS="$(subcommand_status)"
+
+    case "${STATUS}" in
+        "not created")
+            subcommand_create
+            subcommand_mount
+            ;;
+        "not mounted")
+            subcommand_mount
+            ;;
+        "mounted")
+            print_stderr "Already mounted"
+            ;;
+        *)
+            print_stderr "${STATUS}: invalid status"
+            exit 1
+            ;;
+    esac
+}
+
+function subcommand_delete() {
+    print_stderr "Deleting..."
+    lvremove -f "/dev/${ACTIVE_VG}/${ACTIVE_SNAPSHOT_LV}"
+    print_stderr "Deleted successfully"
+}
+
+function subcommand_module() {
+    echo "${ACTIVE_SNAPSHOT_MODULE}"
+}
+
+function subcommand_mount() {
+    print_stderr "Mounting..."
+    mkdir -p "${ACTIVE_SNAPSHOT_MOUNTPOINT}"
+    mount \
+    -t "${ACTIVE_SNAPSHOT_TYPE}" \
+    -o "${ACTIVE_SNAPSHOT_OPTIONS}" \
+    "/dev/${ACTIVE_VG}/${ACTIVE_SNAPSHOT_LV}" \
+    "${ACTIVE_SNAPSHOT_MOUNTPOINT}"
+    print_stderr "Mounted successfully"
+}
+
+function subcommand_mountpoint() {
+    echo "${ACTIVE_SNAPSHOT_MOUNTPOINT}"
+}
+
+function subcommand_status() {
+    DEVICE="/dev/${ACTIVE_VG}/${ACTIVE_SNAPSHOT_LV}"
+
+    if [ -e "${DEVICE}" ]
+    then
+        if mountpoint "${ACTIVE_SNAPSHOT_MOUNTPOINT}" > /dev/null 2>&1
+        then
+            REAL_DEVICE="$(findmnt -n -f -o SOURCE "${ACTIVE_SNAPSHOT_MOUNTPOINT}")"
+
+            if [ "$(realpath "${DEVICE}")" == "$(realpath "${REAL_DEVICE}" 2> /dev/null || true)" ]
+            then
+                echo "mounted"
+                return 0
+            else
+                print_stderr "Active snapshot mountpoint is used by other device (${REAL_DEVICE})"
+                exit 1
+            fi
+        else
+            echo "not mounted"
+            return 0
+        fi
+    else
+        echo "not created"
+        return 0
+    fi
+}
+
+function subcommand_unmount() {
+    sleep 3 # XXX
+    print_stderr "Unmounting..."
+    umount "${ACTIVE_SNAPSHOT_MOUNTPOINT}"
+    rmdir "${ACTIVE_SNAPSHOT_MOUNTPOINT}"
+    print_stderr "Unmounted successfully"
+}
+
+function subcommand_unmount_and_delete() {
+    STATUS="$(subcommand_status)"
+
+    case "${STATUS}" in
+        "mounted")
+            subcommand_unmount
+            subcommand_delete
+            ;;
+        "not mounted")
+            subcommand_delete
+            ;;
+        "not created")
+            print_stderr "Already deleted"
+            ;;
+        *)
+            print_stderr "${STATUS}: invalid status"
+            exit 1
+            ;;
+    esac
+}
+
+while getopts 'h' OPT
+do
+    case "${OPT}" in
+        h)
+            help
+            exit 1
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+case "${1}" in
+    create)
+        subcommand_create
+        ;;
+    create-and-mount)
+        subcommand_create_and_mount
+        ;;
+    delete)
+        subcommand_delete
+        ;;
+    module)
+        subcommand_module
+        ;;
+    mount)
+        subcommand_mount
+        ;;
+    mountpoint)
+        subcommand_mountpoint
+        ;;
+    status)
+        subcommand_status
+        ;;
+    unmount)
+        subcommand_unmount
+        ;;
+    unmount-and-delete)
+        subcommand_unmount_and_delete
+        ;;
+    *)
+        print_stderr "${1}: invalid subcommand"
+        exit 1
+        ;;
+esac
