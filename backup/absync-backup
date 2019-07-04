@@ -41,6 +41,8 @@ function subcommand_sync() {
 
     mkdir -p "${BACKUP_MOUNTPOINT}/${DEST}"
 
+    ionice "-n${BACKUP_RSYNC_IONICE:-4}" \
+    nice "-n${BACKUP_RSYNC_NICE:-0}" \
     rsync \
     "${OPTIONS[@]}" \
     "${SRC}" \
